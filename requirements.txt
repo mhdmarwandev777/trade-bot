@@ -1,0 +1,5 @@
+alpaca-py
+anthropic
+pandas
+numpy
+python-dotenv
