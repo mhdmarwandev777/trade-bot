@@ -57,6 +57,8 @@ MAX_NOTIONAL     = 500         # hard cap in USD per trade
 # For stocks: how many shares per trade
 QTY = 1
 
+DAILY_LOSS_LIMIT_PCT = 0.03   # stop trading if down 3% in a day
+
 # ─────────────────────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────────────────────
@@ -103,6 +105,18 @@ def get_notional() -> float:
     account = trading_client.get_account()
     cash = float(account.cash)
     return min(cash * MAX_NOTIONAL_PCT, MAX_NOTIONAL)
+
+
+# Daily loss limit
+def is_daily_loss_limit_hit() -> bool:
+    account  = trading_client.get_account()
+    equity   = float(account.equity)
+    last_eq  = float(account.last_equity)   # equity at start of day
+    daily_pl = (equity - last_eq) / last_eq
+    if daily_pl < -DAILY_LOSS_LIMIT_PCT:
+        log.warning(f"Daily loss limit hit: {daily_pl:.2%} — stopping for today")
+        return True
+    return False
 
 # ─────────────────────────────────────────────────────────
 #  MARKET DATA — fetch OHLCV candles
@@ -409,6 +423,11 @@ def main():
         cycle += 1
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info(f"\n[Cycle #{cycle}] {now}")
+
+        if is_daily_loss_limit_hit():
+            log.info("Bot paused — daily loss limit reached. Resuming tomorrow.")
+            time.sleep(60 * 60)   # sleep 1 hour then recheck
+            continue
 
         try:
             # 1. Fetch market data
