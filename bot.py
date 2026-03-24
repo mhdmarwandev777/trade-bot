@@ -1,6 +1,11 @@
 """
-Claude AI Trading Bot — Alpaca Markets
-Works natively on Mac. Paper trading by default.
+Claude AI Trading Bot — Alpaca Markets  (Enhanced v2)
+======================================================
+Improvements over v1:
+  1. Multi-timeframe confirmation  (M15 + H1 must agree)
+  2. Trailing stop + drawdown tracking
+  3. Portfolio-aware Claude prompt  (position, P&L, regime)
+  4. Risk-per-trade position sizing  (risk 1% of equity per trade)
 
 Install:
     pip install alpaca-py anthropic pandas numpy python-dotenv
@@ -10,8 +15,8 @@ Install:
     ALPACA_API_KEY=PKxxxxxxxxxxxxxxxx
     ALPACA_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     ALPACA_BASE_URL=https://paper-api.alpaca.markets
-    TELEGRAM_BOT_TOKEN=123456789:ABCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    TELEGRAM_CHAT_ID=123456789
+    TELEGRAM_BOT_TOKEN=123456789:ABCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # optional
+    TELEGRAM_CHAT_ID=123456789                                          # optional
 """
 
 import os
@@ -41,27 +46,29 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────
-#  CONFIG — edit these
+#  CONFIG
 # ─────────────────────────────────────────────────────────
 
-# Choose your market:
-#   Stocks:  "AAPL", "SPY", "QQQ", "TSLA"
-#   Crypto:  "BTC/USD", "ETH/USD"  (24/7 market — best for bots)
-SYMBOL      = "BTC/USD"       # change to "SPY" for stocks
-MARKET_TYPE = "crypto"        # "crypto" or "stock"
+SYMBOL      = "BTC/USD"   # "AAPL", "SPY", "ETH/USD", etc.
+MARKET_TYPE = "crypto"    # "crypto" or "stock"
 
-SLEEP_SECS     = 60 * 15      # analyze every 15 minutes
-MIN_CONFIDENCE = 65            # skip trades below this %
-BARS           = 100           # candles to fetch (≥50 required for MA50)
+SLEEP_SECS     = 60 * 15  # analyze every 15 minutes
+MIN_CONFIDENCE = 65        # skip trades below this %
+BARS_M15       = 100       # candles for M15 (primary)
+BARS_H1        = 60        # candles for H1  (confirmation)
 
-# Position sizing (crypto)
-MAX_NOTIONAL_PCT = 0.10        # max 10% of available cash per trade
-MAX_NOTIONAL     = 500         # hard cap in USD per trade
+# Risk-per-trade: lose at most this % of equity if SL is hit
+RISK_PER_TRADE_PCT = 0.01   # 1% of equity per trade
+MAX_NOTIONAL       = 1000   # hard cap in USD regardless of sizing
 
-# For stocks: how many shares per trade
-QTY = 1
+# Drawdown guard
+DAILY_LOSS_LIMIT_PCT = 0.03   # pause if down 3% in a day
+MAX_DRAWDOWN_PCT     = 0.08   # pause if down 8% from equity peak (session)
 
-DAILY_LOSS_LIMIT_PCT = 0.03   # stop trading if down 3% in a day
+# Trailing stop: once price moves this many × ATR in our favour,
+# move stop to break-even; keep trailing by TRAIL_STEP_ATR × ATR after that.
+TRAIL_ATR_TRIGGER = 1.0   # activate trailing after 1× ATR profit
+TRAIL_STEP_ATR    = 0.5   # trail increments of 0.5× ATR
 
 # ─────────────────────────────────────────────────────────
 #  LOGGING
@@ -78,11 +85,41 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
+#  PERSISTENT STATE  (survives restarts)
+# ─────────────────────────────────────────────────────────
+
+STATE_FILE = "bot_state.json"
+
+def load_state() -> dict:
+    defaults = {
+        "cycle":            0,
+        "peak_equity":      0.0,
+        "session_trades":   [],        # list of {side, entry, exit, pnl}
+        "trailing_stop":    None,      # active trailing stop price (float or None)
+        "trade_entry_price": None,     # price at which current position was entered
+        "trade_side":       None,      # "BUY" or "SELL"
+    }
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                saved = json.load(f)
+            defaults.update(saved)
+        except Exception:
+            pass
+    return defaults
+
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save state: {e}")
+
+# ─────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────
 
 def send_telegram(msg: str) -> None:
-    """Send an HTML-formatted message via Telegram bot. Silently skips if not configured."""
     if not TG_TOKEN or not TG_CHAT:
         return
     try:
@@ -97,43 +134,48 @@ def send_telegram(msg: str) -> None:
         log.warning(f"Telegram send failed: {e}")
 
 
-def build_status_msg(ind: dict, signal: dict | None = None) -> str:
-    """Build the 15-min cycle status message."""
+def build_status_msg(ind_m15: dict, ind_h1: dict, signal: dict | None,
+                     mtf_ok: bool, state: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    rsi_label  = "🔴 OVERBOUGHT" if ind["rsi"] > 70 else "🟢 OVERSOLD" if ind["rsi"] < 30 else "⚪️ Neutral"
-    macd_label = "📈 Bullish" if ind["macd"] > ind["macd_sig"] else "📉 Bearish"
-    trend_icon = "🚀" if ind["trend"] == "up" else "🔻"
-    ma_label   = "✨ Golden Cross" if ind["ma_cross"] == "golden" else "💀 Death Cross"
-    bb_label   = ("⬆️ Above upper (overbought)" if ind["last"] > ind["bb_upper"]
-                  else "⬇️ Below lower (oversold)" if ind["last"] < ind["bb_lower"]
-                  else "↔️ Inside bands")
-    vol_label  = "🔥 High" if ind["vol_ratio"] > 1.5 else "😴 Low" if ind["vol_ratio"] < 0.7 else "📊 Normal"
+    def rsi_label(rsi):
+        return "🔴 OB" if rsi > 70 else "🟢 OS" if rsi < 30 else "⚪️ Neutral"
+
+    def macd_label(m, s):
+        return "📈 Bull" if m > s else "📉 Bear"
+
+    trend_icon = "🚀" if ind_m15["trend"] == "up" else "🔻"
+    ma_label   = "✨ Golden" if ind_m15["ma_cross"] == "golden" else "💀 Death"
+    mtf_label  = "✅ ALIGNED" if mtf_ok else "❌ DIVERGED"
+
+    ts = state.get("trailing_stop")
+    ts_str = f"${ts:,.2f}" if ts else "—"
 
     msg = (
         f"📊 <b>{SYMBOL} · M15 Scan</b>\n"
         f"🕐 {now}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Price:     <b>${ind['last']:,.2f}</b>\n"
-        f"{trend_icon} Trend:     {ind['trend'].capitalize()}  |  {ma_label}\n"
+        f"💰 Price:  <b>${ind_m15['last']:,.2f}</b>  {trend_icon}  {ma_label}\n"
+        f"🔁 MTF H1: {mtf_label}\n"
         f"─────────────────────\n"
-        f"🔢 RSI(14):   <b>{ind['rsi']}</b>  {rsi_label}\n"
-        f"📊 MACD:      {ind['macd']}  (hist: {ind['macd_hist']})  {macd_label}\n"
-        f"📏 Bollinger: {bb_label}\n"
-        f"🔊 Volume:    {ind['vol_ratio']}x  {vol_label}\n"
+        f"  <b>M15</b> RSI={ind_m15['rsi']} {rsi_label(ind_m15['rsi'])} | "
+        f"MACD {macd_label(ind_m15['macd'], ind_m15['macd_sig'])}\n"
+        f"  <b>H1 </b> RSI={ind_h1['rsi']} {rsi_label(ind_h1['rsi'])} | "
+        f"MACD {macd_label(ind_h1['macd'], ind_h1['macd_sig'])}\n"
+        f"  Vol: {ind_m15['vol_ratio']}x  |  ATR: {ind_m15['atr']}\n"
+        f"  Trailing stop: {ts_str}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
     )
 
     if signal is None:
-        msg += "⏭️ <i>Skipped — weak setup (no Claude call)</i>"
+        msg += "⏭️ <i>Skipped (weak setup or MTF divergence)</i>"
     else:
-        sig_icon = "🟢" if signal["signal"] == "BUY" else "🔴" if signal["signal"] == "SELL" else "🟡"
+        icon = "🟢" if signal["signal"] == "BUY" else "🔴" if signal["signal"] == "SELL" else "🟡"
         msg += (
-            f"🤖 Claude: {sig_icon} <b>{signal['signal']}</b>  "
-            f"({signal['confidence']}% confidence)\n"
+            f"🤖 Claude: {icon} <b>{signal['signal']}</b> ({signal['confidence']}%)\n"
+            f"📐 Regime: {signal.get('regime','?')}\n"
             f"💬 {signal['reason']}"
         )
-
     return msg
 
 # ─────────────────────────────────────────────────────────
@@ -155,7 +197,7 @@ else:
     data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 # ─────────────────────────────────────────────────────────
-#  ACCOUNT INFO
+#  ACCOUNT / RISK HELPERS
 # ─────────────────────────────────────────────────────────
 
 def print_account():
@@ -165,73 +207,110 @@ def print_account():
     log.info(f"Portfolio value: ${float(account.portfolio_value):,.2f}")
     log.info(f"Paper trading: {account.status}")
 
-def get_notional() -> float:
-    """Dynamic position sizing: 10% of cash, capped at MAX_NOTIONAL."""
-    account = trading_client.get_account()
-    cash = float(account.cash)
-    return min(cash * MAX_NOTIONAL_PCT, MAX_NOTIONAL)
+
+def get_equity() -> float:
+    return float(trading_client.get_account().equity)
 
 
-# Daily loss limit
 def is_daily_loss_limit_hit() -> bool:
     account  = trading_client.get_account()
     equity   = float(account.equity)
-    last_eq  = float(account.last_equity)   # equity at start of day
+    last_eq  = float(account.last_equity)
     daily_pl = (equity - last_eq) / last_eq
     if daily_pl < -DAILY_LOSS_LIMIT_PCT:
-        log.warning(f"Daily loss limit hit: {daily_pl:.2%} — stopping for today")
+        log.warning(f"Daily loss limit hit: {daily_pl:.2%}")
         send_telegram(
             f"⛔️ <b>DAILY LOSS LIMIT HIT</b>\n"
             f"📉 Daily P&amp;L: <b>{daily_pl:.2%}</b>\n"
-            f"⏸ Bot paused — rechecking in 1 hour"
+            f"⏸ Bot paused for 1 hour"
         )
         return True
     return False
 
+
+def is_max_drawdown_hit(state: dict) -> bool:
+    equity = get_equity()
+    if equity > state["peak_equity"]:
+        state["peak_equity"] = equity          # update high-water mark
+        save_state(state)
+    if state["peak_equity"] > 0:
+        dd = (state["peak_equity"] - equity) / state["peak_equity"]
+        if dd > MAX_DRAWDOWN_PCT:
+            log.warning(f"Max drawdown hit: {dd:.2%} from peak ${state['peak_equity']:,.2f}")
+            send_telegram(
+                f"⛔️ <b>MAX DRAWDOWN HIT</b>\n"
+                f"📉 Drawdown: <b>{dd:.2%}</b> from peak\n"
+                f"⏸ Bot paused for 1 hour"
+            )
+            return True
+    return False
+
+
+# ── IMPROVEMENT 4: Risk-per-trade position sizing ────────
+def calc_notional(entry: float, stop_loss: float) -> float:
+    """
+    Size so that if SL is hit, we lose exactly RISK_PER_TRADE_PCT of equity.
+    notional = (equity × risk%) / (|entry - sl| / entry)
+    Capped at MAX_NOTIONAL.
+    """
+    equity = get_equity()
+    risk_dollars = equity * RISK_PER_TRADE_PCT
+    sl_distance_pct = abs(entry - stop_loss) / entry
+    if sl_distance_pct == 0:
+        return min(equity * 0.05, MAX_NOTIONAL)   # fallback: 5% of equity
+    notional = risk_dollars / sl_distance_pct
+    notional = min(notional, MAX_NOTIONAL)
+    log.info(f"  Position sizing: equity=${equity:,.2f} risk=${risk_dollars:.2f} "
+             f"SL-dist={sl_distance_pct:.3%} → notional=${notional:.2f}")
+    return round(notional, 2)
+
 # ─────────────────────────────────────────────────────────
-#  MARKET DATA — fetch OHLCV candles
+#  MARKET DATA
 # ─────────────────────────────────────────────────────────
 
-def get_candles() -> pd.DataFrame:
+def _fetch_bars(timeframe: TimeFrame, n_bars: int) -> pd.DataFrame:
+    """Generic bar fetcher for any timeframe."""
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(hours=BARS)  # generous lookback buffer
+    # generous lookback so we always get n_bars after exchange gaps
+    hours = n_bars * (1 if timeframe == TimeFrame.Hour else 0.25) * 2
+    start = end - timedelta(hours=max(hours, 48))
 
     if MARKET_TYPE == "crypto":
-        req = CryptoBarsRequest(
-            symbol_or_symbols=SYMBOL,
-            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-            start=start,
-            end=end,
-            limit=BARS,
-        )
+        req  = CryptoBarsRequest(symbol_or_symbols=SYMBOL, timeframe=timeframe,
+                                 start=start, end=end, limit=n_bars)
         bars = data_client.get_crypto_bars(req)
     else:
-        req = StockBarsRequest(
-            symbol_or_symbols=SYMBOL,
-            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-            start=start,
-            end=end,
-            limit=BARS,
-        )
+        req  = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=timeframe,
+                                start=start, end=end, limit=n_bars)
         bars = data_client.get_stock_bars(req)
 
     symbol_key = SYMBOL.replace("/", "")
     df = bars.df
-
-    # Flatten multi-index if present
     if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol_key, level=0) if symbol_key in df.index.get_level_values(0) else df.droplevel(0)
+        df = df.xs(symbol_key, level=0) if symbol_key in df.index.get_level_values(0) \
+             else df.droplevel(0)
 
     df = df[["open", "high", "low", "close", "volume"]].dropna()
+    return df
 
+
+def get_candles_m15() -> pd.DataFrame:
+    df = _fetch_bars(TimeFrame(15, TimeFrameUnit.Minute), BARS_M15)
     if len(df) < 50:
-        raise ValueError(f"Not enough data: got {len(df)} bars, need at least 50 for MA50")
+        raise ValueError(f"M15: only {len(df)} bars (need ≥50)")
+    log.info(f"  Fetched {len(df)} M15 candles")
+    return df
 
-    log.info(f"  Fetched {len(df)} candles for {SYMBOL}")
+
+def get_candles_h1() -> pd.DataFrame:
+    df = _fetch_bars(TimeFrame.Hour, BARS_H1)
+    if len(df) < 26:
+        raise ValueError(f"H1: only {len(df)} bars (need ≥26 for MACD)")
+    log.info(f"  Fetched {len(df)} H1 candles")
     return df
 
 # ─────────────────────────────────────────────────────────
-#  INDICATORS
+#  INDICATORS  (shared for both timeframes)
 # ─────────────────────────────────────────────────────────
 
 def calc_indicators(df: pd.DataFrame) -> dict:
@@ -240,11 +319,11 @@ def calc_indicators(df: pd.DataFrame) -> dict:
     low   = df["low"]
     vol   = df["volume"]
 
-    # RSI (14) — Wilder's smoothing (EWM, not simple rolling mean)
+    # RSI (Wilder's smoothing)
     delta = close.diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rsi   = round(float(100 - 100 / (1 + gain.iloc[-1] / loss.iloc[-1])), 1)
+    rsi   = round(float(100 - 100 / (1 + gain.iloc[-1] / (loss.iloc[-1] + 1e-9))), 1)
 
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -253,16 +332,16 @@ def calc_indicators(df: pd.DataFrame) -> dict:
     sig   = round(float((ema12 - ema26).ewm(span=9, adjust=False).mean().iloc[-1]), 4)
     hist  = round(macd - sig, 4)
 
-    # Moving averages
-    ma20  = round(float(close.rolling(20).mean().iloc[-1]), 4)
-    ma50  = round(float(close.rolling(50).mean().iloc[-1]), 4)
+    # MAs (only reliable if enough bars)
+    ma20 = round(float(close.rolling(20).mean().iloc[-1]), 4) if len(df) >= 20 else None
+    ma50 = round(float(close.rolling(50).mean().iloc[-1]), 4) if len(df) >= 50 else None
 
-    # Bollinger Bands
-    std      = float(close.rolling(20).std().iloc[-1])
-    bb_upper = round(ma20 + 2 * std, 4)
-    bb_lower = round(ma20 - 2 * std, 4)
+    # Bollinger
+    std      = float(close.rolling(20).std().iloc[-1]) if len(df) >= 20 else 0
+    bb_upper = round((ma20 or 0) + 2 * std, 4)
+    bb_lower = round((ma20 or 0) - 2 * std, 4)
 
-    # ATR (14)
+    # ATR
     tr  = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -270,12 +349,12 @@ def calc_indicators(df: pd.DataFrame) -> dict:
     ], axis=1).max(axis=1)
     atr = round(float(tr.rolling(14).mean().iloc[-1]), 4)
 
-    # Volume ratio: current bar vs 20-bar average
-    vol_avg   = float(vol.rolling(20).mean().iloc[-1])
+    # Volume ratio
+    vol_avg   = float(vol.rolling(20).mean().iloc[-1]) if len(df) >= 20 else float(vol.mean())
     vol_ratio = round(float(vol.iloc[-1]) / vol_avg, 2) if vol_avg > 0 else 1.0
 
     last   = round(float(close.iloc[-1]), 4)
-    prev10 = round(float(close.iloc[-10]), 4)
+    prev10 = round(float(close.iloc[max(-10, -len(df))]), 4)
 
     return {
         "last":      last,
@@ -292,64 +371,190 @@ def calc_indicators(df: pd.DataFrame) -> dict:
         "atr":       atr,
         "vol_ratio": vol_ratio,
         "trend":     "up" if last > prev10 else "down",
-        "ma_cross":  "golden" if ma20 > ma50 else "death",
+        "ma_cross":  "golden" if (ma20 and ma50 and ma20 > ma50) else "death",
     }
 
 # ─────────────────────────────────────────────────────────
-#  CLAUDE AI ANALYSIS
+#  IMPROVEMENT 1: Multi-timeframe confirmation
 # ─────────────────────────────────────────────────────────
 
-def ask_claude(ind: dict, df: pd.DataFrame) -> dict:
-    # Last 20 candles as a table for pattern context
-    recent_candles = df.tail(20)[["open", "high", "low", "close", "volume"]].round(2).to_string()
+def mtf_agrees(ind_m15: dict, ind_h1: dict) -> tuple[bool, str]:
+    """
+    Return (aligned, reason).
+    A BUY signal on M15 is only valid if H1 is also bullish (MACD > signal,
+    RSI not overbought, trend up). Vice-versa for SELL.
+    """
+    m15_bullish = (ind_m15["macd"] > ind_m15["macd_sig"] and
+                   ind_m15["trend"] == "up")
+    h1_bullish  = (ind_h1["macd"]  > ind_h1["macd_sig"]  and
+                   ind_h1["rsi"] < 70)
 
-    prompt = f"""You are a professional trading analyst. Analyze this live {SYMBOL} market data and return a precise trade signal.
+    m15_bearish = (ind_m15["macd"] < ind_m15["macd_sig"] and
+                   ind_m15["trend"] == "down")
+    h1_bearish  = (ind_h1["macd"]  < ind_h1["macd_sig"]  and
+                   ind_h1["rsi"] > 30)
 
-SYMBOL: {SYMBOL}
-TIMEFRAME: 15-minute candles
-CURRENT PRICE: {ind['last']}
-SESSION: High={ind['high']}  Low={ind['low']}
-TREND (10-bar): {ind['trend']}
+    if m15_bullish and h1_bullish:
+        return True, "Both timeframes bullish"
+    if m15_bearish and h1_bearish:
+        return True, "Both timeframes bearish"
+    return False, (f"M15 {'bull' if m15_bullish else 'bear'} vs "
+                   f"H1 {'bull' if h1_bullish else 'bear'} — diverged")
 
-TECHNICAL INDICATORS:
-- RSI(14):       {ind['rsi']}  {'→ OVERBOUGHT' if ind['rsi'] > 70 else '→ OVERSOLD' if ind['rsi'] < 30 else '→ neutral'}
-- MACD:          {ind['macd']}  Signal: {ind['macd_sig']}  Hist: {ind['macd_hist']}  {'→ bullish' if ind['macd'] > ind['macd_sig'] else '→ bearish'}
-- MA20 / MA50:   {ind['ma20']} / {ind['ma50']}  → {ind['ma_cross']} cross
-- Bollinger:     Upper={ind['bb_upper']}  Lower={ind['bb_lower']}  {'→ above upper (overbought)' if ind['last'] > ind['bb_upper'] else '→ below lower (oversold)' if ind['last'] < ind['bb_lower'] else '→ inside bands'}
-- ATR(14):       {ind['atr']}  (current volatility)
-- Volume ratio:  {ind['vol_ratio']}x  {'→ HIGH volume (confirms move)' if ind['vol_ratio'] > 1.5 else '→ low volume (weak signal)' if ind['vol_ratio'] < 0.7 else '→ normal volume'}
+# ─────────────────────────────────────────────────────────
+#  IMPROVEMENT 2: Trailing stop management
+# ─────────────────────────────────────────────────────────
 
-RECENT CANDLES (oldest → newest, last 20 bars):
+def update_trailing_stop(state: dict, current_price: float, atr: float) -> bool:
+    """
+    Check and update trailing stop. Returns True if stop was hit (position must close).
+    Modifies state in place.
+    """
+    qty   = get_position()
+    side  = state.get("trade_side")
+    entry = state.get("trade_entry_price")
+    ts    = state.get("trailing_stop")
+
+    if qty == 0 or not side or not entry:
+        # No open position — clear trailing state
+        state["trailing_stop"]     = None
+        state["trade_entry_price"] = None
+        state["trade_side"]        = None
+        return False
+
+    trigger = TRAIL_ATR_TRIGGER * atr
+    step    = TRAIL_STEP_ATR    * atr
+
+    if side == "BUY":
+        profit = current_price - entry
+        if profit >= trigger:
+            new_stop = current_price - step
+            if ts is None or new_stop > ts:
+                state["trailing_stop"] = round(new_stop, 2)
+                log.info(f"  Trailing stop updated → ${state['trailing_stop']:,.2f}")
+        if ts and current_price <= ts:
+            log.info(f"  Trailing stop HIT at ${current_price:,.2f} (stop was ${ts:,.2f})")
+            return True
+
+    elif side == "SELL":   # short (stocks only — crypto can't short)
+        profit = entry - current_price
+        if profit >= trigger:
+            new_stop = current_price + step
+            if ts is None or new_stop < ts:
+                state["trailing_stop"] = round(new_stop, 2)
+                log.info(f"  Trailing stop updated → ${state['trailing_stop']:,.2f}")
+        if ts and current_price >= ts:
+            log.info(f"  Trailing stop HIT at ${current_price:,.2f} (stop was ${ts:,.2f})")
+            return True
+
+    return False
+
+# ─────────────────────────────────────────────────────────
+#  IMPROVEMENT 3: Portfolio-aware Claude prompt
+# ─────────────────────────────────────────────────────────
+
+def ask_claude(ind_m15: dict, ind_h1: dict, df_m15: pd.DataFrame, state: dict) -> dict:
+    """Ask Claude with full portfolio context + chain-of-thought JSON response."""
+
+    account        = trading_client.get_account()
+    equity         = float(account.equity)
+    cash           = float(account.cash)
+    daily_pl       = equity - float(account.last_equity)
+    daily_pl_pct   = daily_pl / float(account.last_equity) * 100
+    current_qty    = get_position()
+    position_side  = state.get("trade_side") or "NONE"
+    entry_price    = state.get("trade_entry_price") or 0.0
+    trailing_stop  = state.get("trailing_stop") or 0.0
+
+    open_pnl = 0.0
+    if current_qty != 0 and entry_price:
+        if position_side == "BUY":
+            open_pnl = (ind_m15["last"] - entry_price) * current_qty
+        else:
+            open_pnl = (entry_price - ind_m15["last"]) * abs(current_qty)
+
+    session_trades = state.get("session_trades", [])
+    wins  = sum(1 for t in session_trades if t.get("pnl", 0) > 0)
+    total = len(session_trades)
+    win_rate_str = f"{wins}/{total} ({wins/total*100:.0f}%)" if total else "N/A"
+
+    recent_candles = df_m15.tail(20)[["open","high","low","close","volume"]].round(2).to_string()
+
+    prompt = f"""You are a professional quantitative trading analyst. Analyze the market data and portfolio state below, then return a precise JSON trade signal.
+
+═══════════════ PORTFOLIO STATE ═══════════════
+Account equity:       ${equity:,.2f}
+Available cash:       ${cash:,.2f}
+Today's P&L:          ${daily_pl:+.2f}  ({daily_pl_pct:+.2f}%)
+Open position:        {position_side}  qty={current_qty}  entry=${entry_price:,.2f}
+Open trade P&L:       ${open_pnl:+.2f}
+Trailing stop:        ${trailing_stop:,.2f} (0 = inactive)
+Session win rate:     {win_rate_str}
+
+═══════════════ M15 INDICATORS (PRIMARY) ═══════════════
+Price:       {ind_m15['last']}   High: {ind_m15['high']}  Low: {ind_m15['low']}
+RSI(14):     {ind_m15['rsi']}   {'→ OVERBOUGHT' if ind_m15['rsi']>70 else '→ OVERSOLD' if ind_m15['rsi']<30 else '→ neutral'}
+MACD:        {ind_m15['macd']}  Signal: {ind_m15['macd_sig']}  Hist: {ind_m15['macd_hist']}
+MA20/MA50:   {ind_m15['ma20']} / {ind_m15['ma50']}  → {ind_m15['ma_cross']} cross
+Bollinger:   Upper={ind_m15['bb_upper']}  Lower={ind_m15['bb_lower']}
+ATR(14):     {ind_m15['atr']}
+Volume:      {ind_m15['vol_ratio']}x avg  {'→ HIGH (confirms move)' if ind_m15['vol_ratio']>1.5 else '→ LOW (weak)' if ind_m15['vol_ratio']<0.7 else '→ normal'}
+Trend:       {ind_m15['trend']}
+
+═══════════════ H1 INDICATORS (CONFIRMATION) ═══════════════
+Price:       {ind_h1['last']}
+RSI(14):     {ind_h1['rsi']}   {'→ OVERBOUGHT' if ind_h1['rsi']>70 else '→ OVERSOLD' if ind_h1['rsi']<30 else '→ neutral'}
+MACD:        {ind_h1['macd']}  Signal: {ind_h1['macd_sig']}  Hist: {ind_h1['macd_hist']}
+MA cross:    {ind_h1['ma_cross']}
+Trend:       {ind_h1['trend']}
+
+═══════════════ RECENT M15 CANDLES (last 20) ═══════════════
 {recent_candles}
 
-DECISION RULES:
-- Signal BUY or SELL only when at least 3 indicators agree
-- If mixed signals or uncertain → HOLD
-- stop_loss must be at least 1x ATR away from entry
-- take_profit must give minimum 1:2 risk/reward ratio
-- confidence below 65 → always return HOLD
-- Low volume (ratio < 0.7) reduces confidence by 10 points
+═══════════════ DECISION RULES ═══════════════
+1. Classify market regime: "trending_up", "trending_down", "ranging", or "volatile"
+2. BUY/SELL only when ≥3 M15 indicators AND H1 trend agree
+3. Do NOT signal BUY if already LONG (position_side=BUY); do NOT signal SELL if already SHORT
+4. If already in a position and seeing reversal signals → signal CLOSE instead
+5. stop_loss must be at least 1× ATR from entry
+6. take_profit must be at least 2× the SL distance (minimum 1:2 R:R)
+7. Low volume (ratio <0.7) reduces confidence by 10 points
+8. If today's P&L is already negative and confidence <75 → return HOLD
+9. In "ranging" regime → prefer HOLD unless price is at a band extreme
+10. confidence <{MIN_CONFIDENCE} → always return HOLD
 
-Respond ONLY with valid JSON, absolutely no extra text or markdown:
-{{"signal":"BUY","entry":{ind['last']},"stop_loss":0.0,"take_profit":0.0,"confidence":75,"reason":"brief one sentence explanation"}}"""
+Think step-by-step in "reasoning_steps" before giving your final signal.
+
+Respond ONLY with valid JSON, no markdown, no extra text:
+{{
+  "reasoning_steps": "1. Regime is X because... 2. M15 says... 3. H1 confirms/denies... 4. Portfolio context means...",
+  "regime": "trending_up",
+  "signal": "BUY",
+  "entry": {ind_m15['last']},
+  "stop_loss": 0.0,
+  "take_profit": 0.0,
+  "confidence": 75,
+  "reason": "one concise sentence for the Telegram notification"
+}}"""
 
     last_err = None
     for attempt in range(3):
         try:
             response = claude_client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=300,
+                model="claude-sonnet-4-20250514",
+                max_tokens=600,
                 messages=[{"role": "user", "content": prompt}]
             )
             raw = response.content[0].text.strip()
             raw = raw.replace("```json", "").replace("```", "").strip()
             result = json.loads(raw)
 
-            # Validate SL/TP are non-zero for actionable signals
+            log.info(f"  Claude reasoning: {result.get('reasoning_steps','')[:200]}")
+
             if result.get("signal") in ("BUY", "SELL"):
                 if result.get("stop_loss", 0) == 0 or result.get("take_profit", 0) == 0:
-                    log.warning(f"  Claude returned zero SL/TP on attempt {attempt + 1}, retrying...")
-                    last_err = ValueError("Zero SL/TP in response")
+                    log.warning(f"  Zero SL/TP on attempt {attempt+1}, retrying...")
+                    last_err = ValueError("Zero SL/TP")
                     time.sleep(1)
                     continue
 
@@ -357,7 +562,7 @@ Respond ONLY with valid JSON, absolutely no extra text or markdown:
 
         except (json.JSONDecodeError, KeyError) as e:
             last_err = e
-            log.warning(f"  Claude parse error (attempt {attempt + 1}): {e}")
+            log.warning(f"  Claude parse error (attempt {attempt+1}): {e}")
             time.sleep(1)
 
     raise RuntimeError(f"Claude failed after 3 attempts: {last_err}")
@@ -367,7 +572,6 @@ Respond ONLY with valid JSON, absolutely no extra text or markdown:
 # ─────────────────────────────────────────────────────────
 
 def get_position() -> float:
-    """Returns current position qty or 0 if none."""
     try:
         symbol_key = SYMBOL.replace("/", "")
         pos = trading_client.get_open_position(symbol_key)
@@ -375,21 +579,65 @@ def get_position() -> float:
     except Exception:
         return 0.0
 
-def close_position():
-    """Close existing position before reversing."""
+
+def close_position(state: dict, reason: str = "signal"):
+    """Close position and record trade result."""
     try:
-        symbol_key = SYMBOL.replace("/", "")
+        symbol_key  = SYMBOL.replace("/", "")
+        current_qty = get_position()
+        entry       = state.get("trade_entry_price", 0.0)
+        side        = state.get("trade_side")
+
         trading_client.close_position(symbol_key)
-        log.info(f"  Closed existing {SYMBOL} position")
+        log.info(f"  Closed {SYMBOL} position — {reason}")
         time.sleep(2)
+
+        # Record trade
+        account     = trading_client.get_account()
+        exit_price  = float(trading_client.get_account().equity)  # approximate
+        if entry and side and current_qty:
+            current_price = calc_indicators(get_candles_m15())["last"]
+            pnl = (current_price - entry) * current_qty if side == "BUY" \
+                  else (entry - current_price) * abs(current_qty)
+            state["session_trades"].append({
+                "side":  side,
+                "entry": entry,
+                "exit":  current_price,
+                "pnl":   round(pnl, 2),
+                "reason": reason,
+            })
+
+        # Clear trailing state
+        state["trailing_stop"]     = None
+        state["trade_entry_price"] = None
+        state["trade_side"]        = None
+        save_state(state)
+
     except Exception as e:
         log.warning(f"  Could not close position: {e}")
+
+
+def wait_for_fill(order_id: str, timeout: int = 30) -> bool:
+    """Poll until order is filled or timeout. Returns True if filled."""
+    for _ in range(timeout):
+        try:
+            order = trading_client.get_order_by_id(order_id)
+            if order.status.value in ("filled", "partially_filled"):
+                return True
+            if order.status.value in ("canceled", "expired", "rejected"):
+                log.warning(f"  Order {order_id} ended with status: {order.status}")
+                return False
+        except Exception:
+            pass
+        time.sleep(1)
+    log.warning(f"  Order {order_id} not confirmed filled after {timeout}s")
+    return False
 
 # ─────────────────────────────────────────────────────────
 #  ORDER EXECUTION
 # ─────────────────────────────────────────────────────────
 
-def place_order(signal: dict):
+def place_order(signal: dict, state: dict):
     action = signal["signal"]
 
     if action == "HOLD":
@@ -402,66 +650,78 @@ def place_order(signal: dict):
 
     current_qty = get_position()
 
-    # Crypto: Alpaca does not support short selling — SELL = close long only
-    if MARKET_TYPE == "crypto" and action == "SELL":
-        if current_qty > 0:
-            close_position()
-            log.info("  → Closed LONG (SELL signal on crypto — no shorting available)")
-            send_telegram(
-                f"🔴 <b>POSITION CLOSED — {SYMBOL}</b>\n"
-                f"💬 SELL signal received (crypto: closing long)\n"
-                f"🎯 Confidence: {signal['confidence']}%\n"
-                f"💡 {signal['reason']}"
-            )
-        else:
-            log.info("  → SELL skipped — no long position to close (crypto can't short)")
+    # Handle CLOSE signal (reversal detected by Claude)
+    if action == "CLOSE":
+        if current_qty != 0:
+            close_position(state, reason="Claude CLOSE signal")
+            send_telegram(f"🔄 <b>POSITION CLOSED</b>\n💬 {signal['reason']}")
         return
 
-    # If already in same direction, skip
+    # Crypto: no shorting
+    if MARKET_TYPE == "crypto" and action == "SELL":
+        if current_qty > 0:
+            close_position(state, reason="SELL signal (crypto close long)")
+            send_telegram(
+                f"🔴 <b>LONG CLOSED — {SYMBOL}</b>\n"
+                f"💬 {signal['reason']}\n"
+                f"🎯 Confidence: {signal['confidence']}%"
+            )
+        else:
+            log.info("  → SELL skipped — no long to close (crypto can't short)")
+        return
+
+    # Skip if already in same direction
     if action == "BUY"  and current_qty > 0:
-        log.info(f"  → Already LONG {SYMBOL}, skipping")
+        log.info("  → Already LONG, skipping")
         return
     if action == "SELL" and current_qty < 0:
-        log.info(f"  → Already SHORT {SYMBOL}, skipping")
+        log.info("  → Already SHORT, skipping")
         return
+
+    # Slippage guard: skip if price moved >0.5% from Claude's entry
+    entry_price  = signal["entry"]
+    current_price = signal["entry"]   # will be overridden below if we can
+    try:
+        current_price = calc_indicators(get_candles_m15())["last"]
+        slippage_pct  = abs(current_price - entry_price) / entry_price
+        if slippage_pct > 0.005:
+            log.warning(f"  → Skipped — slippage {slippage_pct:.3%} > 0.5% "
+                        f"(entry={entry_price}, now={current_price})")
+            return
+    except Exception:
+        pass  # proceed if we can't check
 
     # Close opposite position first
     if current_qty != 0:
-        close_position()
+        close_position(state, reason="reversing position")
 
     side     = OrderSide.BUY if action == "BUY" else OrderSide.SELL
-    notional = get_notional()
     sl_price = round(signal["stop_loss"],   2)
     tp_price = round(signal["take_profit"], 2)
 
+    # ── IMPROVEMENT 4: risk-based notional ──────────────
+    notional = calc_notional(entry_price, sl_price)
+
     def _build_order(bracket: bool):
         if MARKET_TYPE == "crypto":
-            kwargs = dict(
-                symbol=SYMBOL.replace("/", ""),
-                notional=notional,
-                side=side,
-                time_in_force=TimeInForce.GTC,
-            )
+            kwargs = dict(symbol=SYMBOL.replace("/", ""), notional=notional,
+                          side=side, time_in_force=TimeInForce.GTC)
         else:
-            kwargs = dict(
-                symbol=SYMBOL,
-                qty=QTY,
-                side=side,
-                time_in_force=TimeInForce.DAY,
-            )
+            qty_shares = max(1, int(notional / entry_price))
+            kwargs     = dict(symbol=SYMBOL, qty=qty_shares,
+                              side=side, time_in_force=TimeInForce.DAY)
         if bracket:
-            kwargs["order_class"]  = OrderClass.BRACKET
-            kwargs["take_profit"]  = TakeProfitRequest(limit_price=tp_price)
-            kwargs["stop_loss"]    = StopLossRequest(stop_price=sl_price)
+            kwargs["order_class"] = OrderClass.BRACKET
+            kwargs["take_profit"] = TakeProfitRequest(limit_price=tp_price)
+            kwargs["stop_loss"]   = StopLossRequest(stop_price=sl_price)
         return MarketOrderRequest(**kwargs)
 
-    # Try bracket order first; fall back to plain market order if not supported
     order = None
     try:
         order = trading_client.submit_order(_build_order(bracket=True))
         log.info("  → Bracket order placed (SL/TP attached)")
     except Exception as e:
-        log.warning(f"  Bracket order rejected ({e}), retrying as plain market order...")
+        log.warning(f"  Bracket rejected ({e}), trying plain market order...")
         try:
             order = trading_client.submit_order(_build_order(bracket=False))
             log.warning("  → Plain market order placed — monitor SL/TP manually!")
@@ -469,25 +729,29 @@ def place_order(signal: dict):
             log.error(f"  → Order FAILED: {e2}")
             return
 
-    log.info(f"  → {action} order filled!")
-    log.info(f"     Order ID:    {order.id}")
-    log.info(f"     Symbol:      {SYMBOL}")
-    log.info(f"     Side:        {action}")
-    log.info(f"     Notional:    ${notional:.2f}")
-    log.info(f"     Confidence:  {signal['confidence']}%")
-    log.info(f"     Entry:       ~{signal['entry']}")
-    log.info(f"     Stop loss:   {sl_price}")
-    log.info(f"     Take profit: {tp_price}")
-    log.info(f"     Reason:      {signal['reason']}")
+    # Confirm fill
+    filled = wait_for_fill(str(order.id))
+    if not filled:
+        log.warning("  → Order not confirmed filled — check manually")
 
-    tg_icon = "🟢" if action == "BUY" else "🔴"
+    # Update state for trailing stop tracking
+    state["trade_side"]        = action
+    state["trade_entry_price"] = entry_price
+    state["trailing_stop"]     = None
+    save_state(state)
+
+    log.info(f"  → {action} | ${notional:.2f} notional | conf={signal['confidence']}% | "
+             f"SL={sl_price} TP={tp_price}")
+
+    icon = "🟢" if action == "BUY" else "🔴"
     send_telegram(
-        f"{tg_icon} <b>{action} ORDER PLACED</b>\n"
+        f"{icon} <b>{action} ORDER PLACED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Symbol:      <b>{SYMBOL}</b>\n"
         f"💰 Notional:    <b>${notional:,.2f}</b>\n"
         f"🎯 Confidence:  {signal['confidence']}%\n"
-        f"📍 Entry:       ~{signal['entry']:,}\n"
+        f"📐 Regime:      {signal.get('regime','?')}\n"
+        f"📍 Entry:       ~{entry_price:,}\n"
         f"🛑 Stop Loss:   {sl_price:,}\n"
         f"✅ Take Profit: {tp_price:,}\n"
         f"🆔 Order ID:    <code>{order.id}</code>\n"
@@ -499,74 +763,110 @@ def place_order(signal: dict):
 # ─────────────────────────────────────────────────────────
 
 def main():
-    log.info("=" * 55)
-    log.info("  Claude AI Trading Bot — Alpaca Markets")
-    log.info("=" * 55)
+    log.info("=" * 60)
+    log.info("  Claude AI Trading Bot v2 — Alpaca Markets")
+    log.info("=" * 60)
     print_account()
-    log.info(f"  Symbol:         {SYMBOL}")
-    log.info(f"  Timeframe:      M15")
-    log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
-    log.info("=" * 55)
+    log.info(f"  Symbol:          {SYMBOL}")
+    log.info(f"  Timeframes:      M15 (primary) + H1 (confirmation)")
+    log.info(f"  Risk per trade:  {RISK_PER_TRADE_PCT:.0%} of equity")
+    log.info(f"  Min confidence:  {MIN_CONFIDENCE}%")
+    log.info(f"  Max drawdown:    {MAX_DRAWDOWN_PCT:.0%} from peak")
+    log.info("=" * 60)
 
+    state   = load_state()
     account = trading_client.get_account()
+    equity  = float(account.equity)
+
+    if state["peak_equity"] == 0:
+        state["peak_equity"] = equity
+        save_state(state)
+
     send_telegram(
-        f"🤖 <b>Claude Trading Bot Started</b>\n"
+        f"🤖 <b>Claude Trading Bot v2 Started</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Symbol:     <b>{SYMBOL}</b>\n"
-        f"⏱ Timeframe:  M15 (every 15 min)\n"
-        f"💵 Portfolio:  <b>${float(account.portfolio_value):,.2f}</b>\n"
-        f"💰 Cash:       ${float(account.cash):,.2f}\n"
-        f"🎯 Min conf:   {MIN_CONFIDENCE}%\n"
-        f"🛡 Loss limit: {DAILY_LOSS_LIMIT_PCT:.0%}/day"
+        f"💱 Symbol:      <b>{SYMBOL}</b>\n"
+        f"⏱ Timeframes:  M15 + H1 confirmation\n"
+        f"💵 Equity:      <b>${equity:,.2f}</b>\n"
+        f"📐 Risk/trade:  {RISK_PER_TRADE_PCT:.0%} of equity\n"
+        f"🎯 Min conf:    {MIN_CONFIDENCE}%\n"
+        f"🛡 Loss limit:  {DAILY_LOSS_LIMIT_PCT:.0%}/day | {MAX_DRAWDOWN_PCT:.0%} max DD"
     )
 
-    cycle = 0
     while True:
-        cycle += 1
+        state["cycle"] = state.get("cycle", 0) + 1
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log.info(f"\n[Cycle #{cycle}] {now}")
+        log.info(f"\n[Cycle #{state['cycle']}] {now}")
 
-        if is_daily_loss_limit_hit():
-            log.info("Bot paused — daily loss limit reached. Resuming tomorrow.")
-            time.sleep(60 * 60)   # sleep 1 hour then recheck
+        # ── Risk gates ──────────────────────────────────
+        if is_daily_loss_limit_hit() or is_max_drawdown_hit(state):
+            time.sleep(60 * 60)
             continue
 
+        signal   = None
+        mtf_ok   = False
+        ind_m15  = {}
+        ind_h1   = {}
+
         try:
-            # 1. Fetch market data
-            df  = get_candles()
-            ind = calc_indicators(df)
+            # 1. Fetch both timeframes
+            df_m15  = get_candles_m15()
+            df_h1   = get_candles_h1()
+            ind_m15 = calc_indicators(df_m15)
+            ind_h1  = calc_indicators(df_h1)
 
             log.info(
-                f"  Price: {ind['last']} | RSI={ind['rsi']} | MACD={ind['macd']} | "
-                f"Trend={ind['trend']} | MA cross={ind['ma_cross']} | Vol={ind['vol_ratio']}x"
+                f"  M15 → Price={ind_m15['last']} RSI={ind_m15['rsi']} "
+                f"MACD={ind_m15['macd']} Trend={ind_m15['trend']}"
+            )
+            log.info(
+                f"  H1  → Price={ind_h1['last']}  RSI={ind_h1['rsi']} "
+                f"MACD={ind_h1['macd']} Trend={ind_h1['trend']}"
             )
 
-            # 2. Pre-filter: skip Claude if setup has no clear directional bias
-            signal      = None
-            rsi_neutral = 42 < ind["rsi"] < 58
-            macd_weak   = abs(ind["macd_hist"]) < ind["last"] * 0.0001
-            if rsi_neutral and macd_weak:
-                log.info(
-                    f"  Skipping Claude — weak setup "
-                    f"(RSI={ind['rsi']}, MACD hist={ind['macd_hist']})"
+            # ── IMPROVEMENT 2: Check trailing stop first ──
+            trail_hit = update_trailing_stop(state, ind_m15["last"], ind_m15["atr"])
+            if trail_hit:
+                log.info("  Trailing stop triggered — closing position")
+                close_position(state, reason="trailing stop")
+                send_telegram(
+                    f"🔔 <b>TRAILING STOP HIT — {SYMBOL}</b>\n"
+                    f"📍 Price: ${ind_m15['last']:,.2f}\n"
+                    f"🛑 Stop was: ${state.get('trailing_stop') or 0:,.2f}"
                 )
+                save_state(state)
+                time.sleep(SLEEP_SECS)
+                continue
+
+            # ── IMPROVEMENT 1: Multi-timeframe gate ──────
+            mtf_ok, mtf_reason = mtf_agrees(ind_m15, ind_h1)
+            log.info(f"  MTF check: {'✅' if mtf_ok else '❌'} {mtf_reason}")
+
+            # Pre-filter: skip weak setups (no Claude API call wasted)
+            rsi_neutral = 42 < ind_m15["rsi"] < 58
+            macd_weak   = abs(ind_m15["macd_hist"]) < ind_m15["last"] * 0.0001
+
+            if not mtf_ok:
+                log.info(f"  Skipping Claude — MTF diverged: {mtf_reason}")
+            elif rsi_neutral and macd_weak:
+                log.info(f"  Skipping Claude — weak M15 setup (RSI={ind_m15['rsi']} MACD hist={ind_m15['macd_hist']})")
             else:
-                # 3. Ask Claude for signal
-                signal = ask_claude(ind, df)
-                log.info(f"  Claude → {signal['signal']} | {signal['confidence']}% confidence")
+                # ── IMPROVEMENT 3: Portfolio-aware Claude ─
+                signal = ask_claude(ind_m15, ind_h1, df_m15, state)
+                log.info(f"  Claude → {signal['signal']} | {signal['confidence']}% | regime={signal.get('regime')}")
                 log.info(f"  Reason: {signal['reason']}")
 
-                # 4. Execute if valid
-                place_order(signal)
+                place_order(signal, state)
 
-            # 5. Send Telegram status update every cycle
-            send_telegram(build_status_msg(ind, signal))
+            # Status update to Telegram every cycle
+            send_telegram(build_status_msg(ind_m15, ind_h1, signal, mtf_ok, state))
 
         except Exception as e:
-            log.error(f"  Error in cycle: {e}", exc_info=True)
+            log.error(f"  Cycle error: {e}", exc_info=True)
             send_telegram(f"⚠️ <b>Bot Error</b>\n<code>{e}</code>")
 
-        log.info(f"  Sleeping {SLEEP_SECS // 60} min until next cycle...\n")
+        save_state(state)
+        log.info(f"  Sleeping {SLEEP_SECS // 60} min...\n")
         time.sleep(SLEEP_SECS)
 
 
