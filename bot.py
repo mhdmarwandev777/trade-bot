@@ -10,12 +10,16 @@ Install:
     ALPACA_API_KEY=PKxxxxxxxxxxxxxxxx
     ALPACA_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     ALPACA_BASE_URL=https://paper-api.alpaca.markets
+    TELEGRAM_BOT_TOKEN=123456789:ABCxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    TELEGRAM_CHAT_ID=123456789
 """
 
 import os
 import json
 import time
 import logging
+import urllib.request
+import urllib.parse
 import pandas as pd
 import numpy as np
 import anthropic
@@ -74,12 +78,73 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
+#  TELEGRAM
+# ─────────────────────────────────────────────────────────
+
+def send_telegram(msg: str) -> None:
+    """Send an HTML-formatted message via Telegram bot. Silently skips if not configured."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    try:
+        url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id":    TG_CHAT,
+            "text":       msg,
+            "parse_mode": "HTML",
+        }).encode()
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception as e:
+        log.warning(f"Telegram send failed: {e}")
+
+
+def build_status_msg(ind: dict, signal: dict | None = None) -> str:
+    """Build the 15-min cycle status message."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    rsi_label  = "🔴 OVERBOUGHT" if ind["rsi"] > 70 else "🟢 OVERSOLD" if ind["rsi"] < 30 else "⚪️ Neutral"
+    macd_label = "📈 Bullish" if ind["macd"] > ind["macd_sig"] else "📉 Bearish"
+    trend_icon = "🚀" if ind["trend"] == "up" else "🔻"
+    ma_label   = "✨ Golden Cross" if ind["ma_cross"] == "golden" else "💀 Death Cross"
+    bb_label   = ("⬆️ Above upper (overbought)" if ind["last"] > ind["bb_upper"]
+                  else "⬇️ Below lower (oversold)" if ind["last"] < ind["bb_lower"]
+                  else "↔️ Inside bands")
+    vol_label  = "🔥 High" if ind["vol_ratio"] > 1.5 else "😴 Low" if ind["vol_ratio"] < 0.7 else "📊 Normal"
+
+    msg = (
+        f"📊 <b>{SYMBOL} · M15 Scan</b>\n"
+        f"🕐 {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Price:     <b>${ind['last']:,.2f}</b>\n"
+        f"{trend_icon} Trend:     {ind['trend'].capitalize()}  |  {ma_label}\n"
+        f"─────────────────────\n"
+        f"🔢 RSI(14):   <b>{ind['rsi']}</b>  {rsi_label}\n"
+        f"📊 MACD:      {ind['macd']}  (hist: {ind['macd_hist']})  {macd_label}\n"
+        f"📏 Bollinger: {bb_label}\n"
+        f"🔊 Volume:    {ind['vol_ratio']}x  {vol_label}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if signal is None:
+        msg += "⏭️ <i>Skipped — weak setup (no Claude call)</i>"
+    else:
+        sig_icon = "🟢" if signal["signal"] == "BUY" else "🔴" if signal["signal"] == "SELL" else "🟡"
+        msg += (
+            f"🤖 Claude: {sig_icon} <b>{signal['signal']}</b>  "
+            f"({signal['confidence']}% confidence)\n"
+            f"💬 {signal['reason']}"
+        )
+
+    return msg
+
+# ─────────────────────────────────────────────────────────
 #  CLIENTS
 # ─────────────────────────────────────────────────────────
 
 API_KEY    = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 claude_client  = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -115,6 +180,11 @@ def is_daily_loss_limit_hit() -> bool:
     daily_pl = (equity - last_eq) / last_eq
     if daily_pl < -DAILY_LOSS_LIMIT_PCT:
         log.warning(f"Daily loss limit hit: {daily_pl:.2%} — stopping for today")
+        send_telegram(
+            f"⛔️ <b>DAILY LOSS LIMIT HIT</b>\n"
+            f"📉 Daily P&amp;L: <b>{daily_pl:.2%}</b>\n"
+            f"⏸ Bot paused — rechecking in 1 hour"
+        )
         return True
     return False
 
@@ -337,6 +407,12 @@ def place_order(signal: dict):
         if current_qty > 0:
             close_position()
             log.info("  → Closed LONG (SELL signal on crypto — no shorting available)")
+            send_telegram(
+                f"🔴 <b>POSITION CLOSED — {SYMBOL}</b>\n"
+                f"💬 SELL signal received (crypto: closing long)\n"
+                f"🎯 Confidence: {signal['confidence']}%\n"
+                f"💡 {signal['reason']}"
+            )
         else:
             log.info("  → SELL skipped — no long position to close (crypto can't short)")
         return
@@ -404,6 +480,20 @@ def place_order(signal: dict):
     log.info(f"     Take profit: {tp_price}")
     log.info(f"     Reason:      {signal['reason']}")
 
+    tg_icon = "🟢" if action == "BUY" else "🔴"
+    send_telegram(
+        f"{tg_icon} <b>{action} ORDER PLACED</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Symbol:      <b>{SYMBOL}</b>\n"
+        f"💰 Notional:    <b>${notional:,.2f}</b>\n"
+        f"🎯 Confidence:  {signal['confidence']}%\n"
+        f"📍 Entry:       ~{signal['entry']:,}\n"
+        f"🛑 Stop Loss:   {sl_price:,}\n"
+        f"✅ Take Profit: {tp_price:,}\n"
+        f"🆔 Order ID:    <code>{order.id}</code>\n"
+        f"💡 {signal['reason']}"
+    )
+
 # ─────────────────────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────────────────────
@@ -417,6 +507,18 @@ def main():
     log.info(f"  Timeframe:      M15")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
     log.info("=" * 55)
+
+    account = trading_client.get_account()
+    send_telegram(
+        f"🤖 <b>Claude Trading Bot Started</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Symbol:     <b>{SYMBOL}</b>\n"
+        f"⏱ Timeframe:  M15 (every 15 min)\n"
+        f"💵 Portfolio:  <b>${float(account.portfolio_value):,.2f}</b>\n"
+        f"💰 Cash:       ${float(account.cash):,.2f}\n"
+        f"🎯 Min conf:   {MIN_CONFIDENCE}%\n"
+        f"🛡 Loss limit: {DAILY_LOSS_LIMIT_PCT:.0%}/day"
+    )
 
     cycle = 0
     while True:
@@ -440,6 +542,7 @@ def main():
             )
 
             # 2. Pre-filter: skip Claude if setup has no clear directional bias
+            signal      = None
             rsi_neutral = 42 < ind["rsi"] < 58
             macd_weak   = abs(ind["macd_hist"]) < ind["last"] * 0.0001
             if rsi_neutral and macd_weak:
@@ -456,8 +559,12 @@ def main():
                 # 4. Execute if valid
                 place_order(signal)
 
+            # 5. Send Telegram status update every cycle
+            send_telegram(build_status_msg(ind, signal))
+
         except Exception as e:
             log.error(f"  Error in cycle: {e}", exc_info=True)
+            send_telegram(f"⚠️ <b>Bot Error</b>\n<code>{e}</code>")
 
         log.info(f"  Sleeping {SLEEP_SECS // 60} min until next cycle...\n")
         time.sleep(SLEEP_SECS)
