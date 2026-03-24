@@ -22,6 +22,8 @@ Install:
 import os
 import json
 import time
+import signal
+import tempfile
 import logging
 import urllib.request
 import urllib.parse
@@ -37,8 +39,9 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     TakeProfitRequest,
     StopLossRequest,
+    StopOrderRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -85,6 +88,20 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
+#  GRACEFUL SHUTDOWN
+# ─────────────────────────────────────────────────────────
+
+_shutdown = False
+
+def _handle_signal(signum, frame):
+    global _shutdown
+    log.info(f"  Shutdown signal {signum} received — finishing current cycle then exiting.")
+    _shutdown = True
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+# ─────────────────────────────────────────────────────────
 #  PERSISTENT STATE  (survives restarts)
 # ─────────────────────────────────────────────────────────
 
@@ -98,6 +115,7 @@ def load_state() -> dict:
         "trailing_stop":    None,      # active trailing stop price (float or None)
         "trade_entry_price": None,     # price at which current position was entered
         "trade_side":       None,      # "BUY" or "SELL"
+        "stop_order_id":    None,      # Alpaca order ID for the live stop order
     }
     if os.path.exists(STATE_FILE):
         try:
@@ -110,8 +128,11 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        dir_name = os.path.dirname(os.path.abspath(STATE_FILE))
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, suffix=".tmp") as tmp:
+            json.dump(state, tmp, indent=2)
+            tmp_path = tmp.name
+        os.replace(tmp_path, STATE_FILE)
     except Exception as e:
         log.warning(f"Could not save state: {e}")
 
@@ -208,12 +229,11 @@ def print_account():
     log.info(f"Paper trading: {account.status}")
 
 
-def get_equity() -> float:
-    return float(trading_client.get_account().equity)
+def get_equity(account) -> float:
+    return float(account.equity)
 
 
-def is_daily_loss_limit_hit() -> bool:
-    account  = trading_client.get_account()
+def is_daily_loss_limit_hit(account) -> bool:
     equity   = float(account.equity)
     last_eq  = float(account.last_equity)
     daily_pl = (equity - last_eq) / last_eq
@@ -228,8 +248,8 @@ def is_daily_loss_limit_hit() -> bool:
     return False
 
 
-def is_max_drawdown_hit(state: dict) -> bool:
-    equity = get_equity()
+def is_max_drawdown_hit(account, state: dict) -> bool:
+    equity = get_equity(account)
     if equity > state["peak_equity"]:
         state["peak_equity"] = equity          # update high-water mark
         save_state(state)
@@ -247,13 +267,13 @@ def is_max_drawdown_hit(state: dict) -> bool:
 
 
 # ── IMPROVEMENT 4: Risk-per-trade position sizing ────────
-def calc_notional(entry: float, stop_loss: float) -> float:
+def calc_notional(entry: float, stop_loss: float, account) -> float:
     """
     Size so that if SL is hit, we lose exactly RISK_PER_TRADE_PCT of equity.
     notional = (equity × risk%) / (|entry - sl| / entry)
     Capped at MAX_NOTIONAL.
     """
-    equity = get_equity()
+    equity = get_equity(account)
     risk_dollars = equity * RISK_PER_TRADE_PCT
     sl_distance_pct = abs(entry - stop_loss) / entry
     if sl_distance_pct == 0:
@@ -432,6 +452,7 @@ def update_trailing_stop(state: dict, current_price: float, atr: float) -> bool:
             if ts is None or new_stop > ts:
                 state["trailing_stop"] = round(new_stop, 2)
                 log.info(f"  Trailing stop updated → ${state['trailing_stop']:,.2f}")
+                sync_stop_order_to_alpaca(state, state["trailing_stop"])
         if ts and current_price <= ts:
             log.info(f"  Trailing stop HIT at ${current_price:,.2f} (stop was ${ts:,.2f})")
             return True
@@ -443,20 +464,65 @@ def update_trailing_stop(state: dict, current_price: float, atr: float) -> bool:
             if ts is None or new_stop < ts:
                 state["trailing_stop"] = round(new_stop, 2)
                 log.info(f"  Trailing stop updated → ${state['trailing_stop']:,.2f}")
+                sync_stop_order_to_alpaca(state, state["trailing_stop"])
         if ts and current_price >= ts:
             log.info(f"  Trailing stop HIT at ${current_price:,.2f} (stop was ${ts:,.2f})")
             return True
 
     return False
 
+def sync_stop_order_to_alpaca(state: dict, stop_price: float):
+    """
+    Cancel any existing tracked stop order, then place a new StopOrderRequest
+    at stop_price on the closing side. Persists the new order ID in state.
+    """
+    old_id = state.get("stop_order_id")
+    if old_id:
+        try:
+            trading_client.cancel_order_by_id(old_id)
+            log.info(f"  Cancelled old stop order {old_id}")
+        except Exception as e:
+            log.warning(f"  Could not cancel old stop order {old_id}: {e}")
+        state["stop_order_id"] = None
+
+    trade_side = state.get("trade_side")
+    if trade_side == "BUY":
+        close_side = OrderSide.SELL
+    elif trade_side == "SELL":
+        close_side = OrderSide.BUY
+    else:
+        log.warning("  sync_stop_order_to_alpaca: no trade_side in state, skipping")
+        return
+
+    qty = get_position()
+    if qty == 0:
+        log.info("  sync_stop_order_to_alpaca: no open position, skipping")
+        return
+
+    try:
+        symbol_key = SYMBOL.replace("/", "")
+        stop_req = StopOrderRequest(
+            symbol=symbol_key,
+            qty=abs(qty),
+            side=close_side,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+        )
+        new_order = trading_client.submit_order(stop_req)
+        state["stop_order_id"] = str(new_order.id)
+        log.info(f"  New stop order placed at ${stop_price:,.2f} → id={new_order.id}")
+        save_state(state)
+    except Exception as e:
+        log.warning(f"  Could not place stop order at ${stop_price:,.2f}: {e}")
+
+
 # ─────────────────────────────────────────────────────────
 #  IMPROVEMENT 3: Portfolio-aware Claude prompt
 # ─────────────────────────────────────────────────────────
 
-def ask_claude(ind_m15: dict, ind_h1: dict, df_m15: pd.DataFrame, state: dict) -> dict:
+def ask_claude(ind_m15: dict, ind_h1: dict, df_m15: pd.DataFrame, state: dict, account) -> dict:
     """Ask Claude with full portfolio context + chain-of-thought JSON response."""
 
-    account        = trading_client.get_account()
     equity         = float(account.equity)
     cash           = float(account.cash)
     daily_pl       = equity - float(account.last_equity)
@@ -588,6 +654,16 @@ def close_position(state: dict, reason: str = "signal"):
         entry       = state.get("trade_entry_price", 0.0)
         side        = state.get("trade_side")
 
+        # Cancel tracked stop order before closing to avoid a ghost stop fill
+        old_stop_id = state.get("stop_order_id")
+        if old_stop_id:
+            try:
+                trading_client.cancel_order_by_id(old_stop_id)
+                log.info(f"  Cancelled stop order {old_stop_id} before closing position")
+            except Exception as e:
+                log.warning(f"  Could not cancel stop order {old_stop_id}: {e}")
+            state["stop_order_id"] = None
+
         trading_client.close_position(symbol_key)
         log.info(f"  Closed {SYMBOL} position — {reason}")
         time.sleep(2)
@@ -611,6 +687,7 @@ def close_position(state: dict, reason: str = "signal"):
         state["trailing_stop"]     = None
         state["trade_entry_price"] = None
         state["trade_side"]        = None
+        state["stop_order_id"]     = None
         save_state(state)
 
     except Exception as e:
@@ -637,7 +714,7 @@ def wait_for_fill(order_id: str, timeout: int = 30) -> bool:
 #  ORDER EXECUTION
 # ─────────────────────────────────────────────────────────
 
-def place_order(signal: dict, state: dict):
+def place_order(signal: dict, state: dict, account):
     action = signal["signal"]
 
     if action == "HOLD":
@@ -700,7 +777,7 @@ def place_order(signal: dict, state: dict):
     tp_price = round(signal["take_profit"], 2)
 
     # ── IMPROVEMENT 4: risk-based notional ──────────────
-    notional = calc_notional(entry_price, sl_price)
+    notional = calc_notional(entry_price, sl_price, account)
 
     def _build_order(bracket: bool):
         if MARKET_TYPE == "crypto":
@@ -738,6 +815,17 @@ def place_order(signal: dict, state: dict):
     state["trade_side"]        = action
     state["trade_entry_price"] = entry_price
     state["trailing_stop"]     = None
+    state["stop_order_id"]     = None
+
+    # If bracket order succeeded, extract and track the stop leg ID
+    if order is not None and hasattr(order, "legs") and order.legs:
+        for leg in order.legs:
+            leg_type = str(getattr(leg, "order_type", "")).lower()
+            if "stop" in leg_type:
+                state["stop_order_id"] = str(leg.id)
+                log.info(f"  Bracket stop leg tracked: id={leg.id} at ${sl_price}")
+                break
+
     save_state(state)
 
     log.info(f"  → {action} | ${notional:.2f} notional | conf={signal['confidence']}% | "
@@ -793,14 +881,20 @@ def main():
         f"🛡 Loss limit:  {DAILY_LOSS_LIMIT_PCT:.0%}/day | {MAX_DRAWDOWN_PCT:.0%} max DD"
     )
 
-    while True:
+    while not _shutdown:
         state["cycle"] = state.get("cycle", 0) + 1
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info(f"\n[Cycle #{state['cycle']}] {now}")
 
+        # ── Fetch account once per cycle (batches 4 API calls into 1) ──
+        account = trading_client.get_account()
+
         # ── Risk gates ──────────────────────────────────
-        if is_daily_loss_limit_hit() or is_max_drawdown_hit(state):
-            time.sleep(60 * 60)
+        if is_daily_loss_limit_hit(account) or is_max_drawdown_hit(account, state):
+            for _ in range(60 * 60):
+                if _shutdown:
+                    break
+                time.sleep(1)
             continue
 
         signal   = None
@@ -852,11 +946,11 @@ def main():
                 log.info(f"  Skipping Claude — weak M15 setup (RSI={ind_m15['rsi']} MACD hist={ind_m15['macd_hist']})")
             else:
                 # ── IMPROVEMENT 3: Portfolio-aware Claude ─
-                signal = ask_claude(ind_m15, ind_h1, df_m15, state)
+                signal = ask_claude(ind_m15, ind_h1, df_m15, state, account)
                 log.info(f"  Claude → {signal['signal']} | {signal['confidence']}% | regime={signal.get('regime')}")
                 log.info(f"  Reason: {signal['reason']}")
 
-                place_order(signal, state)
+                place_order(signal, state, account)
 
             # Status update to Telegram every cycle
             send_telegram(build_status_msg(ind_m15, ind_h1, signal, mtf_ok, state))
@@ -867,7 +961,12 @@ def main():
 
         save_state(state)
         log.info(f"  Sleeping {SLEEP_SECS // 60} min...\n")
-        time.sleep(SLEEP_SECS)
+        for _ in range(SLEEP_SECS):
+            if _shutdown:
+                break
+            time.sleep(1)
+
+    log.info("  Bot shut down cleanly.")
 
 
 if __name__ == "__main__":
